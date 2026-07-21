@@ -1327,6 +1327,28 @@ def _extract_group_values(value: Any) -> List[str]:
     return group_values
 
 
+def _extract_ids_from_path_filter(path: str | None, attribute: str) -> List[str]:
+    """Return ids from a SCIM filtered path like ``members[value eq "id"]``.
+
+    Okta commonly sends membership removals as a filtered path and omits the
+    request body ``value``, so the id lives only inside the ``[value eq "..."]``
+    filter. The ``eq`` operator is matched case-insensitively per the SCIM
+    spec; the id keeps its original case, and single or double quotes are
+    accepted. ``path`` must be the raw, case-preserving path from the patch op.
+    """
+    if not path:
+        return []
+    match = re.match(
+        rf"""\s*{re.escape(attribute)}\s*\[\s*value\s+eq\s+(['"]?)(.*?)\1\s*\]\s*$""",
+        path,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return []
+    extracted = match.group(2)
+    return [extracted] if extracted else []
+
+
 def _handle_displayname_update(op_type: str, value: Any, update_data: Dict[str, Any]) -> None:
     """Handle displayname updates."""
     if op_type == "remove":
@@ -1370,9 +1392,9 @@ def _handle_name_update(path: str, op_type: str, value: Any, scim_metadata: Dict
             scim_metadata["familyName"] = str(value)
 
 
-def _handle_group_operations(op_type: str, value: Any, teams_set: Set[str]) -> Optional[Set[str]]:
+def _handle_group_operations(op_type: str, value: Any, teams_set: Set[str], path: str | None) -> Set[str] | None:
     """Handle group/team membership operations."""
-    group_values = _extract_group_values(value)
+    group_values = _extract_group_values(value) or _extract_ids_from_path_filter(path, "groups")
     if op_type == "replace":
         return set(group_values)
     elif op_type == "add":
@@ -1485,7 +1507,7 @@ def _apply_patch_ops(
         elif _multi_valued_attribute_base(path) in SCIM_MULTI_VALUED_ATTRIBUTE_METADATA_KEYS:
             _handle_multi_valued_attribute_update(path, op_type, value, metadata)
         elif path.startswith("groups"):
-            new_replace_set = _handle_group_operations(op_type, value, teams_set)
+            new_replace_set = _handle_group_operations(op_type, value, teams_set, op.path)
             if new_replace_set is not None:
                 replace_team_set = new_replace_set
         else:
@@ -1907,7 +1929,7 @@ async def _process_group_patch_operations(
                 metadata["externalId"] = str(value)
         elif path.startswith("members"):
             # Handle member operations
-            member_values = _extract_group_values(value)
+            member_values = _extract_group_values(value) or _extract_ids_from_path_filter(op.path, "members")
             # Check the feature flag
             scim_upsert_user = await _get_scim_upsert_user_setting()
             # Validate all users exist or create them based on feature flag

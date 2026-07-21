@@ -13,6 +13,7 @@ from litellm.proxy._types import (
 from litellm.proxy.management_endpoints.scim.scim_v2 import (
     UserProvisionerHelpers,
     _extract_group_member_ids,
+    _extract_ids_from_path_filter,
     _handle_team_membership_changes,
     _process_group_patch_operations,
     _recompute_scim_member_roles,
@@ -2855,3 +2856,79 @@ async def test_patch_group_rename_recomputes_retained_members(mocker):
 
     recompute_mock.assert_awaited_once()
     assert set(recompute_mock.call_args[0][1]) == {"user1"}
+
+
+@pytest.mark.parametrize(
+    "path, attribute, expected",
+    [
+        ('members[value eq "user-1"]', "members", ["user-1"]),
+        ("members[value eq 'user-1']", "members", ["user-1"]),
+        ('members[value EQ "user-1"]', "members", ["user-1"]),
+        ('members[ value  eq  "user-1" ]', "members", ["user-1"]),
+        ('groups[value eq "team-1"]', "groups", ["team-1"]),
+        ('members[value eq "Mixed-CASE-Id"]', "members", ["Mixed-CASE-Id"]),
+        ("members", "members", []),
+        ('groups[value eq "team-1"]', "members", []),
+        (None, "members", []),
+        ('members[value eq ""]', "members", []),
+    ],
+)
+def test_extract_ids_from_path_filter(path, attribute, expected):
+    assert _extract_ids_from_path_filter(path, attribute) == expected
+
+
+@pytest.mark.asyncio
+async def test_process_group_patch_remove_filtered_path_without_value(mocker):
+    """Okta sends group membership removals as a filtered path with no request
+    body value; the member id must be parsed out of members[value eq "..."]"""
+    patch_ops = SCIMPatchOp(
+        schemas=["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        Operations=[SCIMPatchOperation(op="remove", path='members[value eq "user-1"]')],
+    )
+
+    existing_team = mocker.MagicMock()
+    existing_team.members = ["user-1", "user-2"]
+    existing_team.metadata = {}
+
+    prisma_client = mocker.MagicMock()
+    prisma_client.db = mocker.MagicMock()
+    prisma_client.db.litellm_usertable = mocker.MagicMock()
+    prisma_client.db.litellm_usertable.find_unique = AsyncMock(
+        return_value=LiteLLM_UserTable(user_id="user-1")
+    )
+
+    _, final_members = await _process_group_patch_operations(
+        patch_ops=patch_ops,
+        existing_team=existing_team,
+        prisma_client=prisma_client,
+    )
+
+    assert final_members == {"user-2"}
+
+
+@pytest.mark.asyncio
+async def test_process_group_patch_add_filtered_path_without_value(mocker):
+    """A filtered add path with no body value adds the id parsed from the filter."""
+    patch_ops = SCIMPatchOp(
+        schemas=["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        Operations=[SCIMPatchOperation(op="add", path='members[value eq "user-3"]')],
+    )
+
+    existing_team = mocker.MagicMock()
+    existing_team.members = ["user-1"]
+    existing_team.metadata = {}
+
+    prisma_client = mocker.MagicMock()
+    prisma_client.db = mocker.MagicMock()
+    prisma_client.db.litellm_usertable = mocker.MagicMock()
+    prisma_client.db.litellm_usertable.find_unique = AsyncMock(
+        return_value=LiteLLM_UserTable(user_id="user-3")
+    )
+
+    _, final_members = await _process_group_patch_operations(
+        patch_ops=patch_ops,
+        existing_team=existing_team,
+        prisma_client=prisma_client,
+    )
+
+    assert final_members == {"user-1", "user-3"}
