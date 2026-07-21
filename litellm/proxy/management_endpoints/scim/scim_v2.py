@@ -1334,18 +1334,21 @@ def _extract_ids_from_path_filter(path: str | None, attribute: str) -> List[str]
     request body ``value``, so the id lives only inside the ``[value eq "..."]``
     filter. The ``eq`` operator is matched case-insensitively per the SCIM
     spec; the id keeps its original case, and single or double quotes are
-    accepted. ``path`` must be the raw, case-preserving path from the patch op.
+    accepted. A quoted id may contain escaped quotes and backslashes
+    (``\\"`` and ``\\\\``), which are unescaped before use. ``path`` must be the
+    raw, case-preserving path from the patch op.
     """
     if not path:
         return []
     match = re.match(
-        rf"""\s*{re.escape(attribute)}\s*\[\s*value\s+eq\s+(['"]?)(.*?)\1\s*\]\s*$""",
+        rf"""\s*{re.escape(attribute)}\s*\[\s*value\s+eq\s+(?:(['"])((?:\\.|(?!\1).)*)\1|([^\]\s]+))\s*\]\s*$""",
         path,
         flags=re.IGNORECASE,
     )
     if not match:
         return []
-    extracted = match.group(2)
+    quoted, unquoted = match.group(2), match.group(3)
+    extracted = re.sub(r"\\(.)", r"\1", quoted) if quoted is not None else (unquoted or "")
     return [extracted] if extracted else []
 
 
