@@ -1298,6 +1298,13 @@ async def delete_user(
                     where={"team_id": team.team_id}, data={"members": new_members}
                 )
 
+        if teams:
+            await patch_team_membership(
+                user_id=user_id,
+                teams_ids_to_add_user_to=[],
+                teams_ids_to_remove_user_from=[team.team_id for team in teams],
+            )
+
         await _set_user_keys_blocked(user_id=user_id, blocked=True)
 
         await _delete_rows_referencing_user(prisma_client, user_id=user_id)

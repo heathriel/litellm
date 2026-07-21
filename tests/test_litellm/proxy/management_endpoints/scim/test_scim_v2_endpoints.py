@@ -19,6 +19,7 @@ from litellm.proxy.management_endpoints.scim.scim_v2 import (
     create_group,
     create_user,
     delete_group,
+    delete_user,
     get_users,
     get_service_provider_config,
     patch_group,
@@ -2855,3 +2856,56 @@ async def test_patch_group_rename_recomputes_retained_members(mocker):
 
     recompute_mock.assert_awaited_once()
     assert set(recompute_mock.call_args[0][1]) == {"user1"}
+
+
+@pytest.mark.asyncio
+async def test_delete_user_prunes_members_with_roles(mocker):
+    """Deleting a SCIM user must remove them from every team they belong to via
+    team_member_delete, which prunes members_with_roles (the source of truth for
+    SCIM group membership) so GET /Groups no longer returns a dangling reference
+    to the now-deleted user."""
+    user_id = "scim-del-user"
+
+    existing_user = mocker.MagicMock()
+    existing_user.teams = ["team-1"]
+
+    team = mocker.MagicMock()
+    team.team_id = "team-1"
+    team.members = [user_id, "other-user"]
+
+    mock_prisma_client = mocker.MagicMock()
+    mock_prisma_client.db = mocker.MagicMock()
+    mock_prisma_client.db.litellm_teamtable = mocker.MagicMock()
+    mock_prisma_client.db.litellm_teamtable.find_unique = AsyncMock(return_value=team)
+    mock_prisma_client.db.litellm_teamtable.update = AsyncMock()
+    mock_prisma_client.db.litellm_usertable = mocker.MagicMock()
+    mock_prisma_client.db.litellm_usertable.delete = AsyncMock()
+
+    mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2._get_prisma_client_or_raise_exception",
+        AsyncMock(return_value=mock_prisma_client),
+    )
+    mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2._check_user_exists",
+        AsyncMock(return_value=existing_user),
+    )
+    mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2._set_user_keys_blocked",
+        AsyncMock(),
+    )
+    mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2._delete_rows_referencing_user",
+        AsyncMock(),
+    )
+    team_member_delete_mock = mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2.team_member_delete",
+        AsyncMock(),
+    )
+
+    await delete_user(user_id=user_id)
+
+    team_member_delete_mock.assert_awaited_once()
+    call = team_member_delete_mock.call_args
+    assert call.kwargs["data"].team_id == "team-1"
+    assert call.kwargs["data"].user_id == user_id
+    assert call.kwargs["user_api_key_dict"].user_role == LitellmUserRoles.PROXY_ADMIN
