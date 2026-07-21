@@ -4,8 +4,10 @@ import pytest
 from fastapi import HTTPException
 
 from litellm.proxy._types import (
+    LiteLLM_TeamTable,
     LiteLLM_UserTable,
     LitellmUserRoles,
+    Member,
     NewUserRequest,
     NewUserResponse,
     ProxyException,
@@ -2858,21 +2860,7 @@ async def test_patch_group_rename_recomputes_retained_members(mocker):
     assert set(recompute_mock.call_args[0][1]) == {"user1"}
 
 
-@pytest.mark.asyncio
-async def test_delete_user_prunes_members_with_roles(mocker):
-    """Deleting a SCIM user must remove them from every team they belong to via
-    team_member_delete, which prunes members_with_roles (the source of truth for
-    SCIM group membership) so GET /Groups no longer returns a dangling reference
-    to the now-deleted user."""
-    user_id = "scim-del-user"
-
-    existing_user = mocker.MagicMock()
-    existing_user.teams = ["team-1"]
-
-    team = mocker.MagicMock()
-    team.team_id = "team-1"
-    team.members = [user_id, "other-user"]
-
+def _mock_prisma_for_delete_user(mocker, team):
     mock_prisma_client = mocker.MagicMock()
     mock_prisma_client.db = mocker.MagicMock()
     mock_prisma_client.db.litellm_teamtable = mocker.MagicMock()
@@ -2880,7 +2868,10 @@ async def test_delete_user_prunes_members_with_roles(mocker):
     mock_prisma_client.db.litellm_teamtable.update = AsyncMock()
     mock_prisma_client.db.litellm_usertable = mocker.MagicMock()
     mock_prisma_client.db.litellm_usertable.delete = AsyncMock()
+    return mock_prisma_client
 
+
+def _patch_delete_user_dependencies(mocker, mock_prisma_client, existing_user):
     mocker.patch(
         "litellm.proxy.management_endpoints.scim.scim_v2._get_prisma_client_or_raise_exception",
         AsyncMock(return_value=mock_prisma_client),
@@ -2897,6 +2888,27 @@ async def test_delete_user_prunes_members_with_roles(mocker):
         "litellm.proxy.management_endpoints.scim.scim_v2._delete_rows_referencing_user",
         AsyncMock(),
     )
+
+
+@pytest.mark.asyncio
+async def test_delete_user_prunes_members_with_roles(mocker):
+    """Deleting a SCIM user must remove them from every team they belong to via
+    team_member_delete, which prunes members_with_roles (the source of truth for
+    SCIM group membership) so GET /Groups no longer returns a dangling reference
+    to the now-deleted user."""
+    user_id = "scim-del-user"
+
+    existing_user = mocker.MagicMock()
+    existing_user.teams = ["team-1"]
+
+    team = LiteLLM_TeamTable(
+        team_id="team-1",
+        members=[user_id, "other-user"],
+        members_with_roles=[Member(user_id=user_id, role="user"), Member(user_id="other-user", role="admin")],
+    )
+
+    mock_prisma_client = _mock_prisma_for_delete_user(mocker, team)
+    _patch_delete_user_dependencies(mocker, mock_prisma_client, existing_user)
     team_member_delete_mock = mocker.patch(
         "litellm.proxy.management_endpoints.scim.scim_v2.team_member_delete",
         AsyncMock(),
@@ -2909,3 +2921,63 @@ async def test_delete_user_prunes_members_with_roles(mocker):
     assert call.kwargs["data"].team_id == "team-1"
     assert call.kwargs["data"].user_id == user_id
     assert call.kwargs["user_api_key_dict"].user_role == LitellmUserRoles.PROXY_ADMIN
+    mock_prisma_client.db.litellm_usertable.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_user_surfaces_prune_failure_and_keeps_user(mocker):
+    """A genuine failure while pruning members_with_roles must surface: the
+    endpoint fails loudly and the user row is NOT deleted, so we never report a
+    successful delete while leaving a dangling member (SCIM DELETE is idempotent,
+    so the IdP retries)."""
+    user_id = "scim-del-user"
+
+    existing_user = mocker.MagicMock()
+    existing_user.teams = ["team-1"]
+
+    team = LiteLLM_TeamTable(
+        team_id="team-1",
+        members=[user_id],
+        members_with_roles=[Member(user_id=user_id, role="user")],
+    )
+
+    mock_prisma_client = _mock_prisma_for_delete_user(mocker, team)
+    _patch_delete_user_dependencies(mocker, mock_prisma_client, existing_user)
+    mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2.team_member_delete",
+        AsyncMock(side_effect=Exception("database connection lost")),
+    )
+
+    with pytest.raises(Exception):
+        await delete_user(user_id=user_id)
+
+    mock_prisma_client.db.litellm_usertable.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_user_skips_teams_where_not_a_member(mocker):
+    """If the user is not in a team's members_with_roles, deletion must treat that
+    team as a no-op (no team_member_delete call, no error) and still delete the
+    user, so a stale legacy membership can't block the delete."""
+    user_id = "scim-del-user"
+
+    existing_user = mocker.MagicMock()
+    existing_user.teams = ["team-1"]
+
+    team = LiteLLM_TeamTable(
+        team_id="team-1",
+        members=[user_id],
+        members_with_roles=[Member(user_id="someone-else", role="admin")],
+    )
+
+    mock_prisma_client = _mock_prisma_for_delete_user(mocker, team)
+    _patch_delete_user_dependencies(mocker, mock_prisma_client, existing_user)
+    team_member_delete_mock = mocker.patch(
+        "litellm.proxy.management_endpoints.scim.scim_v2.team_member_delete",
+        AsyncMock(),
+    )
+
+    await delete_user(user_id=user_id)
+
+    team_member_delete_mock.assert_not_awaited()
+    mock_prisma_client.db.litellm_usertable.delete.assert_awaited_once()

@@ -1298,12 +1298,12 @@ async def delete_user(
                     where={"team_id": team.team_id}, data={"members": new_members}
                 )
 
-        if teams:
-            await patch_team_membership(
-                user_id=user_id,
-                teams_ids_to_add_user_to=[],
-                teams_ids_to_remove_user_from=[team.team_id for team in teams],
-            )
+            team_row = LiteLLM_TeamTable(**team.model_dump())
+            if any(member.user_id == user_id for member in team_row.members_with_roles or []):
+                await team_member_delete(
+                    data=TeamMemberDeleteRequest(team_id=team_row.team_id, user_id=user_id),
+                    user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+                )
 
         await _set_user_keys_blocked(user_id=user_id, blocked=True)
 
