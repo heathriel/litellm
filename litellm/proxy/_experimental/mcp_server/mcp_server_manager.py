@@ -2590,8 +2590,20 @@ class MCPServerManager:
         the inbound bearer, and every surface (tools call and list, prompts, resources) resolves
         it here so no surface can diverge (an id_jag caller presenting a fresh IdP JWT must see
         the same sourcing on list as on call). Other modes return None to avoid forwarding it.
+
+        For id_jag the bearer must additionally BE the credential that authenticated the caller:
+        admission prefers the explicit litellm key header, so when that header is present the
+        Authorization bearer is an unvalidated free rider bound to nobody, and exchanging it
+        would let a caller act upstream under any identity whose token they hold. Binding is
+        admission's job, so the rule is structural (was this the admission credential), never a
+        claims comparison re-deriving what admission already decided. Such callers resolve
+        through the stored assertion, which is bound to the authenticated user by construction.
+        The OBO mode keeps its documented exchange-what-was-presented semantics; its identical
+        free-rider shape predates this seam and is tracked as a follow-up.
         """
         if server.auth_type not in (MCPAuth.oauth2_token_exchange, MCPAuth.oauth2_id_jag):
+            return None
+        if server.auth_type == MCPAuth.oauth2_id_jag and MCPRequestHandler.authorization_is_free_rider(raw_headers):
             return None
         return self._extract_bearer_token(oauth2_headers, raw_headers)
 
@@ -4802,7 +4814,7 @@ class MCPServerManager:
 
         subject_token: str | None = None
         if isinstance(spec.config, (TokenExchangeConfig, IdJagConfig)):
-            subject_token = self._extract_bearer_token(oauth2_headers, raw_headers)
+            subject_token = self._subject_bearer_token(mcp_server, raw_headers, oauth2_headers=oauth2_headers)
         elif isinstance(spec.config, PassthroughConfig):
             inbound_token, forwarded_headers = _take_forwarded_authorization(forwarded_headers)
             per_server_token = _passthrough_token_from_mcp_auth_header(mcp_auth_header)

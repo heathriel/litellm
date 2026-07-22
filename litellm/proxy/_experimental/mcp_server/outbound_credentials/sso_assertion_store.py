@@ -311,6 +311,19 @@ def _assertion_is_expired(assertion: SSOIdentityAssertion, now: datetime) -> boo
     return assertion.expires_at <= now + timedelta(seconds=_ASSERTION_EXPIRY_BUFFER_SECONDS)
 
 
+def _oauth_error_code(response: object) -> str | None:
+    """The RFC 6749 section 5.2 ``error`` code from a token-endpoint response body, or None
+    when the body is not a JSON object carrying one."""
+    try:
+        body = response.json()  # pyright: ignore[reportAttributeAccessIssue,reportUnknownMemberType,reportUnknownVariableType]  # httpx response is partially typed
+    except Exception:  # noqa: BLE001  # an unparseable body simply carries no code
+        return None
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]  # narrowed below
+    return error if isinstance(error, str) and error else None
+
+
 async def _post_sso_token_endpoint(url: str, form: dict[str, str]) -> SsoRefreshOutcome:
     import httpx  # noqa: PLC0415
 
@@ -319,15 +332,19 @@ async def _post_sso_token_endpoint(url: str, form: dict[str, str]) -> SsoRefresh
     )
     from litellm.types.llms.custom_http import httpxSpecialProvider  # noqa: PLC0415
 
-    # A 4xx is a definitive verdict on the grant; anything else says nothing about it.
+    # Rejected requires PROOF of a grant verdict: a non-429 4xx carrying a parseable RFC 6749
+    # error code. A 429, a 4xx without the error object (an intermediary answering, not the
+    # token endpoint), a 5xx, a transport failure, or a 2xx whose body is not a JSON object all
+    # prove nothing about the grant and read Unreachable, whose short negative cache doubles as
+    # the backoff.
     try:
         client = get_async_httpx_client(llm_provider=httpxSpecialProvider.Oauth2Check)  # pyright: ignore[reportUnknownVariableType]  # http_handler is untyped
         response = await client.post(url, headers={"Accept": "application/json"}, data=form)  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType]  # httpx handler partially typed
         response.raise_for_status()  # pyright: ignore[reportUnknownMemberType]  # httpx handler partially typed
-        body: dict[str, object] = response.json()  # pyright: ignore[reportUnknownMemberType]  # validated field-by-field by the caller
+        body: object = response.json()  # pyright: ignore[reportUnknownMemberType]  # shape-validated below
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code
-        if 400 <= status_code < 500:
+        if 400 <= status_code < 500 and status_code != 429 and _oauth_error_code(exc.response) is not None:
             verbose_proxy_logger.warning("SSO assertion refresh was rejected with status %s", status_code)
             return SsoRefreshRejected(status_code=status_code)
         verbose_proxy_logger.warning("SSO assertion refresh failed upstream with status %s", status_code)
@@ -335,8 +352,10 @@ async def _post_sso_token_endpoint(url: str, form: dict[str, str]) -> SsoRefresh
     except Exception as exc:  # noqa: BLE001  # transport/parse failure carries no verdict on the grant
         verbose_proxy_logger.warning("SSO assertion refresh request failed: %s", exc)
         return SsoRefreshUnreachable()
-    else:
-        return SsoRefreshGranted(body=body)
+    if not isinstance(body, dict):
+        verbose_proxy_logger.warning("SSO assertion refresh returned a non-object JSON body")
+        return SsoRefreshUnreachable()
+    return SsoRefreshGranted(body=body)
 
 
 class LiveSsoAssertionSource:
