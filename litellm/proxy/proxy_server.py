@@ -13451,7 +13451,7 @@ async def fallback_login(request: Request):
 @router.post("/login", include_in_schema=False)  # hidden since this is a helper for UI sso login
 async def login(request: Request):
     global premium_user, general_settings, master_key
-    from litellm.proxy.auth.login_utils import authenticate_user, create_ui_token_object
+    from litellm.proxy.auth.login_utils import authenticate_user, create_ui_token_object, encode_ui_session_jwt
     from litellm.proxy.utils import get_custom_url
 
     form = await request.form()
@@ -13474,13 +13474,7 @@ async def login(request: Request):
     )
 
     # Generate JWT token
-    import jwt
-
-    jwt_token = jwt.encode(
-        cast(dict, returned_ui_token_object),
-        cast(str, master_key),
-        algorithm="HS256",
-    )
+    jwt_token = encode_ui_session_jwt(returned_ui_token_object, cast(str, master_key))
 
     # Build redirect URL
     litellm_dashboard_ui = get_custom_url(str(request.base_url))
@@ -13490,16 +13484,29 @@ async def login(request: Request):
         litellm_dashboard_ui += "/ui/"
     litellm_dashboard_ui += "?login=success"
 
+    # Honor a same-origin return_to preserved by the sign-in page (e.g. the aggregate DCR connect flow's
+    # authorize round-trip), mirroring the SSO callback; otherwise land on the dashboard. Gated by
+    # _is_same_origin_return_path (strictly relative path) so it can never be an open redirect, and the
+    # one-shot cookie is cleared after use.
+    from litellm.proxy.management_endpoints.ui_sso import _is_same_origin_return_path
+
+    cp_return_to = request.cookies.get("litellm_cp_return_to")
+    redirect_target = litellm_dashboard_ui
+    if cp_return_to and _is_same_origin_return_path(cp_return_to):
+        redirect_target = cp_return_to
+
     # Create redirect response with cookie
-    redirect_response = RedirectResponse(url=litellm_dashboard_ui, status_code=303)
+    redirect_response = RedirectResponse(url=redirect_target, status_code=303)
     redirect_response.set_cookie(key="token", value=jwt_token)
+    if cp_return_to:
+        redirect_response.delete_cookie(key="litellm_cp_return_to")
     return redirect_response
 
 
 @router.post("/v2/login", include_in_schema=False)  # hidden helper for UI logins via API
 async def login_v2(request: Request):
     global premium_user, general_settings, master_key
-    from litellm.proxy.auth.login_utils import authenticate_user, create_ui_token_object
+    from litellm.proxy.auth.login_utils import authenticate_user, create_ui_token_object, encode_ui_session_jwt
     from litellm.proxy.utils import get_custom_url
 
     try:
@@ -13520,13 +13527,7 @@ async def login_v2(request: Request):
             premium_user=premium_user,
         )
 
-        import jwt
-
-        jwt_token = jwt.encode(
-            cast(dict, returned_ui_token_object),
-            cast(str, master_key),
-            algorithm="HS256",
-        )
+        jwt_token = encode_ui_session_jwt(returned_ui_token_object, cast(str, master_key))
 
         litellm_dashboard_ui = get_custom_url(str(request.base_url))
         if litellm_dashboard_ui.endswith("/"):
@@ -13570,7 +13571,7 @@ async def login_v2(request: Request):
 )  # control-plane login — always returns token in body for cross-origin use
 async def login_v3(request: Request):
     global premium_user, general_settings, master_key
-    from litellm.proxy.auth.login_utils import authenticate_user, create_ui_token_object
+    from litellm.proxy.auth.login_utils import authenticate_user, create_ui_token_object, encode_ui_session_jwt
     from litellm.proxy.utils import get_custom_url
 
     try:
@@ -13599,13 +13600,7 @@ async def login_v3(request: Request):
             premium_user=premium_user,
         )
 
-        import jwt
-
-        jwt_token = jwt.encode(
-            cast(dict, returned_ui_token_object),
-            cast(str, master_key),
-            algorithm="HS256",
-        )
+        jwt_token = encode_ui_session_jwt(returned_ui_token_object, cast(str, master_key))
 
         litellm_dashboard_ui = get_custom_url(str(request.base_url))
         if litellm_dashboard_ui.endswith("/"):
